@@ -381,6 +381,19 @@ mod trace_propagation_tests {
         assert_eq!(outbound, inbound);
     }
 
+    /// An empty trace ID must be rejected as invalid context rather than
+    /// accepted as a valid propagated trace, so unrelated requests never look
+    /// correlated and downstream exporters never receive an empty record.
+    #[test]
+    fn empty_trace_id_is_rejected() {
+        let inbound = "00--00f067aa0ba902b7-01";
+        assert_eq!(
+            TraceContext::parse_traceparent(inbound),
+            Err(anchorkit::trace_context::TraceError::InvalidTraceId),
+            "an empty trace ID must not be accepted as valid propagated context"
+        );
+    }
+
     // -----------------------------------------------------------------------
     // 5. Background monitoring
     // -----------------------------------------------------------------------

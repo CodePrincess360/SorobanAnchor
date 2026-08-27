@@ -335,6 +335,12 @@ impl TraceContext {
         if version != TRACEPARENT_VERSION {
             return Err(TraceError::UnsupportedVersion);
         }
+        // Reject an empty trace ID outright. An empty context would otherwise
+        // make unrelated requests look correlated and cause downstream exporters
+        // to reject the record, so it must never be accepted as a valid trace.
+        if trace_id.is_empty() {
+            return Err(TraceError::InvalidTraceId);
+        }
         if !is_valid_id(trace_id, TRACE_ID_HEX_LEN) {
             return Err(TraceError::InvalidTraceId);
         }
