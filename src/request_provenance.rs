@@ -177,7 +177,7 @@ impl ProvenanceRecord {
         metadata: impl Into<String>,
         created_at: u64,
     ) -> Result<Self, ProvenanceError> {
-        let root = Self::root(origin_service, operation, created_at);
+        let root = Self::root(origin_service, operation, created_at)?;
         root.with_metadata(metadata)
     }
 
@@ -260,7 +260,7 @@ impl ProvenanceRecord {
         metadata: impl Into<String>,
         created_at: u64,
     ) -> Result<Self, ProvenanceError> {
-        let child = self.child(child_service, operation, created_at);
+        let child = self.child(child_service, operation, created_at)?;
         child.with_metadata(metadata)
     }
 
