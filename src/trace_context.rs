@@ -629,6 +629,11 @@ mod tests {
             TraceContext::parse_traceparent(&alloc::format!("00-{}-{SPAN}-01", "0".repeat(32))),
             Err(TraceError::InvalidTraceId)
         );
+        // An empty trace ID must be rejected outright (issue #788).
+        assert_eq!(
+            TraceContext::parse_traceparent(&alloc::format!("00--{SPAN}-01")),
+            Err(TraceError::InvalidTraceId)
+        );
         assert_eq!(
             TraceContext::parse_traceparent(&alloc::format!("00-{TRACE}-{}-01", "0".repeat(16))),
             Err(TraceError::InvalidSpanId)
