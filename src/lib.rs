@@ -279,6 +279,8 @@ pub use response_validator::{
     AnchorInfoResponse, DepositResponse as ValidatorDepositResponse, QuoteResponse,
     Sep38QuoteResponse, WithdrawResponse, TransactionStatusResponseValidated,
     SchemaVersion, VALIDATOR_SCHEMA_V1,
+    // Issue #831: unknown SEP-6 status strings classify as Unknown, never success
+    Sep6StatusClass, sep6_status_class,
     // Issue #661: response shape compatibility checks for older anchors
     CompatibilityLevel, CompatibilityReport,
     check_deposit_compatibility, check_withdraw_compatibility,

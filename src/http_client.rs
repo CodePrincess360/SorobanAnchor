@@ -731,6 +731,60 @@ pub fn is_transport_error_retryable(kind: TransportErrorKind) -> bool {
     matches!(kind, TransportErrorKind::Timeout | TransportErrorKind::DnsFailure)
 }
 
+/// Retry classification for an HTTP response status code.
+///
+/// This is the response-status counterpart to [`TransportErrorKind`]: it lets
+/// callers branch on whether a completed HTTP exchange should be retried under
+/// their configured policy instead of hard-coding status checks at each call
+/// site.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum HttpStatusClass {
+    /// 2xx / 3xx — the exchange completed without a server- or client-side error.
+    Success,
+    /// A transient failure. Retrying the same request may succeed. Covers
+    /// `408 Request Timeout`, `429 Too Many Requests` (rate limiting is
+    /// inherently temporary), and the transient `500`, `502`, `503`, `504`
+    /// server errors.
+    Retryable,
+    /// A permanent failure. The request will keep failing until it is changed
+    /// (most `4xx` client errors and non-transient `5xx` such as `501`).
+    Permanent,
+}
+
+/// Classify an HTTP response status code into an [`HttpStatusClass`].
+///
+/// `429 Too Many Requests` maps to [`HttpStatusClass::Retryable`] — rate
+/// limiting is a transient condition, not a permanent server error — so callers
+/// applying [`is_http_status_retryable`] back off and retry rather than failing
+/// the operation outright. Only the status code is inspected; any response body
+/// or headers the caller has already captured are left untouched.
+///
+/// # Examples
+///
+/// ```rust
+/// use anchorkit::http_client::{classify_http_status_code, HttpStatusClass};
+///
+/// assert_eq!(classify_http_status_code(200), HttpStatusClass::Success);
+/// assert_eq!(classify_http_status_code(429), HttpStatusClass::Retryable);
+/// assert_eq!(classify_http_status_code(503), HttpStatusClass::Retryable);
+/// assert_eq!(classify_http_status_code(404), HttpStatusClass::Permanent);
+/// ```
+pub fn classify_http_status_code(status: u16) -> HttpStatusClass {
+    match status {
+        200..=399 => HttpStatusClass::Success,
+        408 | 429 | 500 | 502 | 503 | 504 => HttpStatusClass::Retryable,
+        _ => HttpStatusClass::Permanent,
+    }
+}
+
+/// Returns `true` when an HTTP response status should trigger a retry.
+///
+/// Convenience predicate over [`classify_http_status_code`]; `true` exactly when
+/// the status classifies as [`HttpStatusClass::Retryable`] (including `429`).
+pub fn is_http_status_retryable(status: u16) -> bool {
+    matches!(classify_http_status_code(status), HttpStatusClass::Retryable)
+}
+
 // ---------------------------------------------------------------------------
 // ProxyConfig
 // ---------------------------------------------------------------------------
@@ -1051,11 +1105,42 @@ pub fn build_client(
     proxy: Option<&ProxyConfig>,
     timeout_secs: u64,
 ) -> Result<reqwest::blocking::Client, String> {
+    let timeout = if timeout_secs > 0 {
+        Some(std::time::Duration::from_secs(timeout_secs))
+    } else {
+        None
+    };
+    build_client_with_timeout(proxy, timeout)
+}
+
+/// Shared client construction for the seconds-based [`build_client`] and the
+/// millisecond-precise webhook delivery path.
+///
+/// `timeout` is the total per-request budget as an already-constructed
+/// [`Duration`](std::time::Duration); `None` disables the timeout. Building the
+/// `Duration` at the call site keeps each conversion next to the public option
+/// that names its unit (see [`webhook_timeout`]) instead of forcing every
+/// caller through a seconds-only integer boundary that silently truncates
+/// sub-second budgets.
+///
+/// The redirect chain is always bounded explicitly by
+/// [`ConnectionPolicy::default()`]'s `max_redirects` rather than left to
+/// `reqwest`'s built-in default, so a dependency-side change to that default
+/// cannot widen (or an explicit builder tweak elsewhere disable) the cap.
+#[cfg(feature = "std")]
+fn build_client_with_timeout(
+    proxy: Option<&ProxyConfig>,
+    timeout: Option<std::time::Duration>,
+) -> Result<reqwest::blocking::Client, String> {
     let mut builder = reqwest::blocking::Client::builder();
 
-    if timeout_secs > 0 {
-        builder = builder.timeout(std::time::Duration::from_secs(timeout_secs));
+    if let Some(timeout) = timeout {
+        builder = builder.timeout(timeout);
     }
+
+    // Enforce the configured redirect limit at construction time.
+    let redirect_cap = ConnectionPolicy::default().max_redirects;
+    builder = builder.redirect(reqwest::redirect::Policy::limited(redirect_cap));
 
     if let Some(cfg) = proxy {
         builder = apply_proxy_config(builder, cfg)?;
@@ -1064,6 +1149,29 @@ pub fn build_client(
     builder
         .build()
         .map_err(|e| alloc::format!("failed to build HTTP client: {}", e))
+}
+
+/// Default total request timeout for webhook delivery when the caller leaves
+/// [`WebhookDeliveryConfig::timeout_ms`](crate::webhook::WebhookDeliveryConfig::timeout_ms)
+/// at `0` ("unset").
+#[cfg(feature = "std")]
+const DEFAULT_WEBHOOK_TIMEOUT_SECS: u64 = 30;
+
+/// Convert the public millisecond `timeout_ms` webhook option into a
+/// [`Duration`](std::time::Duration).
+///
+/// The value is interpreted as **milliseconds** — the unit named by the option
+/// and the config schema — so fractional-second budgets are preserved exactly
+/// rather than being floored (and, for values below `1000`, rounded up) by an
+/// integer division to whole seconds. `0` selects
+/// [`DEFAULT_WEBHOOK_TIMEOUT_SECS`].
+#[cfg(feature = "std")]
+fn webhook_timeout(timeout_ms: u64) -> std::time::Duration {
+    if timeout_ms == 0 {
+        std::time::Duration::from_secs(DEFAULT_WEBHOOK_TIMEOUT_SECS)
+    } else {
+        std::time::Duration::from_millis(timeout_ms)
+    }
 }
 
 /// Validate `cfg` and register its proxies on a reqwest client builder.
@@ -1289,13 +1397,7 @@ pub fn deliver_webhook_with_proxy(
     proxy: Option<&ProxyConfig>,
     now_fn: impl Fn() -> u64,
 ) -> Result<(), crate::errors::AnchorKitError> {
-    let timeout_secs = if config.timeout_ms > 0 {
-        (config.timeout_ms / 1000).max(1)
-    } else {
-        30
-    };
-
-    let client = build_client(proxy, timeout_secs)
+    let client = build_client_with_timeout(proxy, Some(webhook_timeout(config.timeout_ms)))
         .map_err(|e| {
             crate::errors::AnchorKitError::with_context(
                 crate::errors::ErrorCode::WebhookDeliveryFailed,
@@ -1377,19 +1479,14 @@ pub fn deliver_webhook_with_proxy_traced(
     proxy: Option<&ProxyConfig>,
     now_fn: impl Fn() -> u64,
 ) -> Result<(), crate::errors::AnchorKitError> {
-    let timeout_secs = if config.timeout_ms > 0 {
-        (config.timeout_ms / 1000).max(1)
-    } else {
-        30
-    };
-
-    let client = build_client(proxy, timeout_secs).map_err(|e| {
-        crate::errors::AnchorKitError::with_context(
-            crate::errors::ErrorCode::WebhookDeliveryFailed,
-            "failed to build HTTP client for webhook delivery",
-            &e,
-        )
-    })?;
+    let client = build_client_with_timeout(proxy, Some(webhook_timeout(config.timeout_ms)))
+        .map_err(|e| {
+            crate::errors::AnchorKitError::with_context(
+                crate::errors::ErrorCode::WebhookDeliveryFailed,
+                "failed to build HTTP client for webhook delivery",
+                &e,
+            )
+        })?;
 
     crate::webhook::deliver_webhook_traced(
         config,
@@ -2476,5 +2573,118 @@ mod tests {
         let json = r#"{"proxy_url":"http://proxy.corp:3128","proxy_password":"oops"}"#;
         let result: Result<ProxyConfig, _> = serde_json::from_str(json);
         assert!(result.is_err(), "unknown fields (likely typos) must be rejected");
+    }
+
+    // ── Issue #828: HTTP 429 is a retryable status ────────────────────────────
+
+    #[test]
+    fn http_status_429_is_retryable() {
+        assert_eq!(classify_http_status_code(429), HttpStatusClass::Retryable);
+        assert!(is_http_status_retryable(429), "rate limiting is transient");
+    }
+
+    #[test]
+    fn http_status_permanent_codes_stay_permanent() {
+        for status in [400u16, 401, 403, 404, 405, 409, 410, 422, 451, 501, 505] {
+            assert_eq!(
+                classify_http_status_code(status),
+                HttpStatusClass::Permanent,
+                "HTTP {status} should classify as permanent"
+            );
+            assert!(!is_http_status_retryable(status));
+        }
+    }
+
+    #[test]
+    fn http_status_success_and_transient_server_errors() {
+        for status in [200u16, 201, 204, 301, 302, 304, 399] {
+            assert_eq!(classify_http_status_code(status), HttpStatusClass::Success);
+            assert!(!is_http_status_retryable(status));
+        }
+        for status in [408u16, 500, 502, 503, 504] {
+            assert_eq!(classify_http_status_code(status), HttpStatusClass::Retryable);
+            assert!(is_http_status_retryable(status));
+        }
+    }
+
+    // ── Issue #827: webhook timeout keeps its millisecond unit ────────────────
+
+    #[cfg(feature = "std")]
+    #[test]
+    fn webhook_timeout_preserves_millisecond_unit() {
+        use std::time::Duration;
+        // 0 means "unset" → default budget.
+        assert_eq!(webhook_timeout(0), Duration::from_secs(DEFAULT_WEBHOOK_TIMEOUT_SECS));
+        // Whole-second values are unchanged.
+        assert_eq!(webhook_timeout(30_000), Duration::from_secs(30));
+        assert_eq!(webhook_timeout(5_000), Duration::from_secs(5));
+        // Sub-second and non-whole-second values are preserved exactly, not
+        // truncated (250ms used to become 1s, 1500ms used to become 1s).
+        assert_eq!(webhook_timeout(1_500), Duration::from_millis(1_500));
+        assert_eq!(webhook_timeout(250), Duration::from_millis(250));
+        assert_eq!(webhook_timeout(1), Duration::from_millis(1));
+    }
+
+    // ── Issue #826: the redirect chain is bounded at client construction ──────
+
+    #[cfg(feature = "std")]
+    #[test]
+    fn build_client_bounds_the_redirect_chain() {
+        use std::io::{Read, Write};
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind loopback");
+        listener.set_nonblocking(true).unwrap();
+        let addr = listener.local_addr().unwrap();
+        let hits = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let hits_srv = std::sync::Arc::clone(&hits);
+
+        // A mock server that answers *every* request with a 302 back to itself:
+        // an endless redirect chain if the client does not cap it.
+        let response = b"HTTP/1.1 302 Found\r\nLocation: /a\r\nContent-Length: 0\r\n\r\n";
+        let server = std::thread::spawn(move || {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+            while std::time::Instant::now() < deadline {
+                match listener.accept() {
+                    Ok((mut stream, _)) => {
+                        hits_srv.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                        let mut buf = [0u8; 512];
+                        let _read = stream.read(&mut buf);
+                        let _ = stream.write_all(response);
+                    }
+                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                        std::thread::sleep(std::time::Duration::from_millis(5));
+                    }
+                    Err(_) => break,
+                }
+            }
+        });
+
+        let client = build_client(None, 5).expect("client builds");
+        let result = client.get(alloc::format!("http://{addr}/start")).send();
+        let _ = server.join();
+
+        let err = result.expect_err("an endless redirect chain must be stopped, not followed");
+        assert!(
+            err.is_redirect() || err.to_string().to_lowercase().contains("redirect"),
+            "expected a redirect-limit error, got: {err}"
+        );
+
+        let cap = ConnectionPolicy::default().max_redirects;
+        let total = hits.load(std::sync::atomic::Ordering::SeqCst);
+        assert!(
+            (2..=cap + 1).contains(&total),
+            "requests should stop at the configured redirect cap ({cap}); saw {total}"
+        );
+    }
+
+    #[cfg(feature = "std")]
+    #[test]
+    fn build_client_still_allows_redirects_within_the_cap() {
+        // The cap bounds the chain; it does not disable redirects and it does
+        // not touch a direct request. The default policy keeps a non-zero
+        // allowance, and clients still build with and without a timeout.
+        assert!(ConnectionPolicy::default().max_redirects >= 1);
+        assert!(build_client(None, 5).is_ok());
+        assert!(build_client(None, 0).is_ok());
     }
 }

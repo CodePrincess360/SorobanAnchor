@@ -123,28 +123,58 @@ pub struct TransactionStatusResponseValidated {
 
 // ── Status validators ─────────────────────────────────────────────────────────
 
-/// Returns `true` when `status` is a recognised SEP-6 transaction status.
-fn is_valid_sep6_status(status: &str) -> bool {
+/// Coarse classification of a SEP-6 transaction `status` string.
+///
+/// The default arm of [`sep6_status_class`] is [`Sep6StatusClass::Unknown`]: a
+/// status the current vocabulary does not recognise — for example one a newer
+/// anchor introduces — is never optimistically treated as a completed or
+/// otherwise successful operation.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum Sep6StatusClass {
+    /// Terminal success: the transfer finished (`completed`).
+    Completed,
+    /// Terminal non-success: the transfer will not complete as requested
+    /// (`refunded`, `expired`, `error`).
+    Failed,
+    /// Still in flight — waiting on the user, the anchor, or the network.
+    Pending,
+    /// Not a recognised SEP-6 status.
+    Unknown,
+}
+
+/// Classify a SEP-6 transaction `status` string.
+///
+/// Recognised values map to [`Completed`](Sep6StatusClass::Completed),
+/// [`Failed`](Sep6StatusClass::Failed) or [`Pending`](Sep6StatusClass::Pending);
+/// every other value falls through the default arm to
+/// [`Unknown`](Sep6StatusClass::Unknown).
+pub fn sep6_status_class(status: &str) -> Sep6StatusClass {
     match status {
+        "completed" => Sep6StatusClass::Completed,
+        "refunded" | "expired" | "error" => Sep6StatusClass::Failed,
         "pending_external"
         | "pending_anchor"
         | "pending_trust"
         | "pending_user"
         | "pending_user_transfer_start"
         | "pending_user_transfer_complete"
-        | "completed"
-        | "refunded"
-        | "expired"
         | "incomplete"
         | "pending"
         | "no_market"
         | "too_small"
         | "too_large"
         | "pending_stellar"
-        | "waiting_customer_action"
-        | "error" => true,
-        _ => false,
+        | "waiting_customer_action" => Sep6StatusClass::Pending,
+        _ => Sep6StatusClass::Unknown,
     }
+}
+
+/// Returns `true` when `status` is a recognised SEP-6 transaction status.
+///
+/// Equivalent to `sep6_status_class(status) != Sep6StatusClass::Unknown`: an
+/// unrecognised status is rejected rather than assumed valid.
+fn is_valid_sep6_status(status: &str) -> bool {
+    !matches!(sep6_status_class(status), Sep6StatusClass::Unknown)
 }
 
 /// Returns `true` when `status` is a recognised quote status.
@@ -1675,5 +1705,47 @@ mod tests {
     fn test_tx_status_compat_incompatible_empty_txn_id() {
         let r = check_transaction_status_compatibility("", "completed", "withdrawal");
         assert_eq!(r.level, CompatibilityLevel::Incompatible);
+    }
+
+    // ── Issue #831: unknown status must not be treated as a success ───────────
+
+    #[test]
+    fn test_sep6_status_class_covers_full_vocabulary() {
+        // Every status is_valid_sep6_status accepts must classify as a concrete
+        // (non-Unknown) class, and the terminal ones keep their meaning.
+        for status in &[
+            "pending_external", "pending_anchor", "pending_trust", "pending_user",
+            "pending_user_transfer_start", "pending_user_transfer_complete", "completed",
+            "refunded", "expired", "incomplete", "pending", "no_market", "too_small",
+            "too_large", "pending_stellar", "waiting_customer_action", "error",
+        ] {
+            assert_ne!(sep6_status_class(status), Sep6StatusClass::Unknown, "{status}");
+            assert!(is_valid_sep6_status(status), "'{status}' must stay recognised");
+        }
+        assert_eq!(sep6_status_class("completed"), Sep6StatusClass::Completed);
+        assert_eq!(sep6_status_class("refunded"), Sep6StatusClass::Failed);
+        assert_eq!(sep6_status_class("expired"), Sep6StatusClass::Failed);
+        assert_eq!(sep6_status_class("error"), Sep6StatusClass::Failed);
+        assert_eq!(sep6_status_class("pending_anchor"), Sep6StatusClass::Pending);
+    }
+
+    #[test]
+    fn test_sep6_status_class_unknown_is_not_completed() {
+        // A status a newer anchor might introduce must classify as Unknown,
+        // never Completed, and must not pass validation.
+        for unknown in ["pending_regulatory_review", "settled", "", "COMPLETED"] {
+            assert_eq!(sep6_status_class(unknown), Sep6StatusClass::Unknown, "{unknown}");
+            assert!(!is_valid_sep6_status(unknown), "{unknown}");
+        }
+    }
+
+    #[test]
+    fn test_validators_reject_unknown_status_regression() {
+        // Deposit / withdraw / transaction-status validators must all fail
+        // closed on an unrecognised status rather than accept it as valid.
+        let unknown = "pending_regulatory_review";
+        assert!(validate_deposit_response("d1", unknown, "GADDR...", 0, 0).is_err());
+        assert!(validate_withdraw_response("w1", unknown, 0).is_err());
+        assert!(validate_transaction_status_response("t1", unknown, "deposit").is_err());
     }
 }
