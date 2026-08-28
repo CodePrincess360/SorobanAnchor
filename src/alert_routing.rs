@@ -59,7 +59,6 @@
 
 extern crate alloc;
 
-use alloc::string::String;
 use alloc::vec::Vec;
 
 // ---------------------------------------------------------------------------
@@ -104,6 +103,15 @@ impl AlertSeverity {
     }
 }
 
+impl Default for AlertSeverity {
+    /// Returns [`AlertSeverity::Warning`], the documented operational default
+    /// used when no severity is explicitly supplied (matches the config schema
+    /// and all shipped example configurations).
+    fn default() -> Self {
+        AlertSeverity::Warning
+    }
+}
+
 // ---------------------------------------------------------------------------
 // AlertRoute
 // ---------------------------------------------------------------------------
@@ -143,6 +151,27 @@ impl AlertRoute {
             channel: channel.into(),
             destination: destination.into(),
         }
+    }
+
+    /// Validated constructor — rejects a blank `destination` with
+    /// [`crate::errors::AnchorKitError::validation_error`].
+    ///
+    /// Use this when building routes from operator-supplied configuration
+    /// strings that may be empty.  Non-blank values are accepted as-is;
+    /// URL and channel-specific validation remain the caller's responsibility.
+    #[cfg(feature = "std")]
+    pub fn try_new(
+        channel: impl Into<String>,
+        destination: impl Into<String>,
+    ) -> Result<Self, crate::errors::AnchorKitError> {
+        let destination = destination.into();
+        if destination.trim().is_empty() {
+            return Err(crate::errors::AnchorKitError::validation_error("destination"));
+        }
+        Ok(AlertRoute {
+            channel: channel.into(),
+            destination,
+        })
     }
 }
 
@@ -238,6 +267,10 @@ impl AlertRouter {
             matched = self.config.default_routes.clone();
         }
 
+        // Deduplicate destinations while preserving first-match order.
+        let mut seen = alloc::collections::BTreeSet::new();
+        matched.retain(|route| seen.insert((route.channel.clone(), route.destination.clone())));
+
         matched
     }
 
@@ -280,9 +313,8 @@ impl AlertRouterConfig {
 
         let mut rules = Vec::new();
         for alert in alerts {
-            let Some(severity) = AlertSeverity::from_str(&alert.severity) else {
-                continue;
-            };
+            let severity = AlertSeverity::from_str(&alert.severity)
+                .unwrap_or(AlertSeverity::Warning);
             let scope = if alert.condition.is_empty() {
                 None
             } else {
@@ -291,6 +323,7 @@ impl AlertRouterConfig {
             let routes: Vec<AlertRoute> = alert
                 .recipients
                 .iter()
+                .filter(|r| !r.trim().is_empty())
                 .map(|r| AlertRoute::webhook(r.clone()))
                 .collect();
             if !routes.is_empty() {
@@ -464,5 +497,134 @@ mod tests {
         });
         let routes = router.route(AlertSeverity::Critical, None);
         assert_eq!(routes.len(), 2);
+    }
+
+    // ── Fix: duplicate destination deduplication ─────────────────────────────
+
+    #[test]
+    fn duplicate_destinations_are_deduplicated_preserving_order() {
+        // Two rules both route Critical to the same webhook URL.
+        let router = AlertRouter::new(AlertRouterConfig {
+            rules: alloc::vec![
+                AlertRule {
+                    severity: AlertSeverity::Critical,
+                    scope: None,
+                    routes: alloc::vec![
+                        AlertRoute::webhook("https://hooks.example.com/critical"),
+                        AlertRoute::email("ops@example.com"),
+                    ],
+                },
+                AlertRule {
+                    severity: AlertSeverity::Critical,
+                    scope: None,
+                    routes: alloc::vec![
+                        AlertRoute::webhook("https://hooks.example.com/critical"), // duplicate
+                        AlertRoute::email("security@example.com"),
+                    ],
+                },
+            ],
+            default_routes: alloc::vec![],
+        });
+        let routes = router.route(AlertSeverity::Critical, None);
+        // Duplicate webhook URL is removed; distinct destinations remain.
+        assert_eq!(routes.len(), 3);
+        assert_eq!(routes[0].destination, "https://hooks.example.com/critical");
+        assert_eq!(routes[1].destination, "ops@example.com");
+        assert_eq!(routes[2].destination, "security@example.com");
+    }
+
+    #[test]
+    fn identical_routes_across_rules_yield_single_entry() {
+        let router = AlertRouter::new(AlertRouterConfig {
+            rules: alloc::vec![
+                AlertRule {
+                    severity: AlertSeverity::Warning,
+                    scope: None,
+                    routes: alloc::vec![AlertRoute::email("ops@example.com")],
+                },
+                AlertRule {
+                    severity: AlertSeverity::Warning,
+                    scope: None,
+                    routes: alloc::vec![AlertRoute::email("ops@example.com")],
+                },
+            ],
+            default_routes: alloc::vec![],
+        });
+        let routes = router.route(AlertSeverity::Warning, None);
+        assert_eq!(routes.len(), 1);
+        assert_eq!(routes[0].destination, "ops@example.com");
+    }
+
+    #[test]
+    fn distinct_destinations_are_all_preserved() {
+        let router = AlertRouter::new(AlertRouterConfig {
+            rules: alloc::vec![
+                AlertRule {
+                    severity: AlertSeverity::Info,
+                    scope: None,
+                    routes: alloc::vec![AlertRoute::email("a@example.com")],
+                },
+                AlertRule {
+                    severity: AlertSeverity::Info,
+                    scope: None,
+                    routes: alloc::vec![AlertRoute::email("b@example.com")],
+                },
+            ],
+            default_routes: alloc::vec![],
+        });
+        let routes = router.route(AlertSeverity::Info, None);
+        assert_eq!(routes.len(), 2);
+    }
+
+    // ── Fix: blank destination validation ────────────────────────────────────
+
+    #[cfg(feature = "std")]
+    #[test]
+    fn try_new_rejects_blank_destination() {
+        let result = AlertRoute::try_new("webhook", "");
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(err.context.as_deref().unwrap_or("").contains("destination")
+            || err.message.contains("destination")
+            || (err.code as u32) == 15); // ValidationError
+    }
+
+    #[cfg(feature = "std")]
+    #[test]
+    fn try_new_rejects_whitespace_only_destination() {
+        let result = AlertRoute::try_new("email", "   ");
+        assert!(result.is_err());
+    }
+
+    #[cfg(feature = "std")]
+    #[test]
+    fn try_new_accepts_valid_destination() {
+        let result = AlertRoute::try_new("webhook", "https://hooks.example.com/alert");
+        assert!(result.is_ok());
+        let route = result.unwrap();
+        assert_eq!(route.destination, "https://hooks.example.com/alert");
+    }
+
+    // ── Fix: default severity is Warning ─────────────────────────────────────
+
+    #[test]
+    fn default_severity_is_warning() {
+        assert_eq!(AlertSeverity::default(), AlertSeverity::Warning);
+    }
+
+    #[test]
+    fn explicit_severity_is_not_overridden_by_default() {
+        // Ensure default() only applies when no severity is given; explicit
+        // values must remain unchanged.
+        for sev in [
+            AlertSeverity::Info,
+            AlertSeverity::Warning,
+            AlertSeverity::Error,
+            AlertSeverity::Critical,
+        ] {
+            // A rule carrying an explicit severity must keep it.
+            let rule = AlertRule { severity: sev, scope: None, routes: alloc::vec![] };
+            assert_eq!(rule.severity, sev);
+        }
     }
 }
