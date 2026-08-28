@@ -36,8 +36,8 @@
 //! };
 //!
 //! let probes = alloc::vec![
-//!     ProbeConfig::new(1, ProbeKind::Ping, "https://anchor.example.com"),
-//!     ProbeConfig::new(2, ProbeKind::StellarToml, "https://anchor.example.com/.well-known/stellar.toml"),
+//!     ProbeConfig::new(1, ProbeKind::Ping, "https://anchor.example.com").unwrap(),
+//!     ProbeConfig::new(2, ProbeKind::StellarToml, "https://anchor.example.com/.well-known/stellar.toml").unwrap(),
 //! ];
 //!
 //! let mut runner = SyntheticProbeRunner::new(probes);
@@ -59,6 +59,7 @@ extern crate alloc;
 use alloc::string::String;
 use alloc::vec::Vec;
 use crate::anchor_health::{HealthWindow, EndpointOutcome};
+use crate::errors::AnchorKitError;
 
 // ---------------------------------------------------------------------------
 // ProbeKind
@@ -113,13 +114,21 @@ pub struct ProbeConfig {
 
 impl ProbeConfig {
     /// Create a probe configuration with a default latency threshold of 2 000 ms.
-    pub fn new(id: u64, kind: ProbeKind, target: impl Into<String>) -> Self {
-        ProbeConfig {
+    ///
+    /// Returns `Err` if `target` is blank (empty or whitespace-only), using the
+    /// same [`AnchorKitError::invalid_endpoint_format`] error returned by the
+    /// shared domain validator so callers see a consistent error type.
+    pub fn new(id: u64, kind: ProbeKind, target: impl Into<String>) -> Result<Self, AnchorKitError> {
+        let target = target.into();
+        if target.trim().is_empty() {
+            return Err(AnchorKitError::invalid_endpoint_format());
+        }
+        Ok(ProbeConfig {
             id,
             kind,
-            target: target.into(),
+            target,
             latency_threshold_ms: 2_000,
-        }
+        })
     }
 
     /// Set the latency threshold (builder-style).
@@ -380,9 +389,9 @@ mod tests {
 
     fn make_probes() -> Vec<ProbeConfig> {
         alloc::vec![
-            ProbeConfig::new(1, ProbeKind::Ping, "https://anchor.example.com"),
-            ProbeConfig::new(2, ProbeKind::StellarToml, "https://anchor.example.com/.well-known/stellar.toml"),
-            ProbeConfig::new(3, ProbeKind::Sep6Info, "https://anchor.example.com/sep6/info"),
+            ProbeConfig::new(1, ProbeKind::Ping, "https://anchor.example.com").unwrap(),
+            ProbeConfig::new(2, ProbeKind::StellarToml, "https://anchor.example.com/.well-known/stellar.toml").unwrap(),
+            ProbeConfig::new(3, ProbeKind::Sep6Info, "https://anchor.example.com/sep6/info").unwrap(),
         ]
     }
 
@@ -424,6 +433,7 @@ mod tests {
     fn latency_above_threshold_becomes_slow_success() {
         let probes = alloc::vec![
             ProbeConfig::new(1, ProbeKind::Ping, "https://anchor.example.com")
+                .unwrap()
                 .with_latency_threshold(100),
         ];
         let runner = SyntheticProbeRunner::new(probes);
@@ -438,6 +448,7 @@ mod tests {
     fn latency_within_threshold_stays_success() {
         let probes = alloc::vec![
             ProbeConfig::new(1, ProbeKind::Ping, "https://anchor.example.com")
+                .unwrap()
                 .with_latency_threshold(1000),
         ];
         let runner = SyntheticProbeRunner::new(probes);
@@ -547,9 +558,9 @@ mod tests {
     #[test]
     fn p50_is_median_of_successful_latencies() {
         let probes = alloc::vec![
-            ProbeConfig::new(1, ProbeKind::Ping, "a"),
-            ProbeConfig::new(2, ProbeKind::Ping, "b"),
-            ProbeConfig::new(3, ProbeKind::Ping, "c"),
+            ProbeConfig::new(1, ProbeKind::Ping, "a").unwrap(),
+            ProbeConfig::new(2, ProbeKind::Ping, "b").unwrap(),
+            ProbeConfig::new(3, ProbeKind::Ping, "c").unwrap(),
         ];
         let latencies = [300u64, 100, 500];
         let mut idx = 0usize;
@@ -579,5 +590,22 @@ mod tests {
     fn probe_outcome_to_endpoint_outcome_failure_carries_reason() {
         let o = ProbeOutcome::Failure("HTTP 503".into());
         assert!(matches!(o.to_endpoint_outcome(), EndpointOutcome::Failure(_)));
+    }
+
+    // ── ProbeConfig::new blank-URL guard (#821) ──────────────────────────────
+
+    #[test]
+    fn new_rejects_empty_target() {
+        assert!(ProbeConfig::new(1, ProbeKind::Ping, "").is_err());
+    }
+
+    #[test]
+    fn new_rejects_whitespace_only_target() {
+        assert!(ProbeConfig::new(1, ProbeKind::Ping, "   ").is_err());
+    }
+
+    #[test]
+    fn new_accepts_valid_https_endpoint() {
+        assert!(ProbeConfig::new(1, ProbeKind::Ping, "https://anchor.example.com").is_ok());
     }
 }

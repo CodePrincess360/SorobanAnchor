@@ -84,8 +84,10 @@ impl Default for DedupConfig {
 #[derive(Debug, Default)]
 pub struct AlertDeduplicator {
     config: DedupConfig,
-    /// Maps fingerprint → Unix timestamp (seconds) of last fired alert.
-    last_fired: RefCell<BTreeMap<String, u64>>,
+    /// Maps fingerprint → (last_fired_at, suppress_count).
+    last_fired: RefCell<BTreeMap<String, (u64, u64)>>,
+    /// JSON-formatted suppression log entries (one per suppressed call).
+    suppression_log: RefCell<Vec<String>>,
 }
 
 impl AlertDeduplicator {
@@ -94,6 +96,7 @@ impl AlertDeduplicator {
         AlertDeduplicator {
             config,
             last_fired: RefCell::new(BTreeMap::new()),
+            suppression_log: RefCell::new(Vec::new()),
         }
     }
 
@@ -111,21 +114,38 @@ impl AlertDeduplicator {
 
         let mut map = self.last_fired.borrow_mut();
 
-        if let Some(&last) = map.get(fingerprint) {
-            if now.saturating_sub(last) < self.config.window_seconds {
-                return false; // still within suppression window
+        if let Some(entry) = map.get_mut(fingerprint) {
+            if now.saturating_sub(entry.0) < self.config.window_seconds {
+                // #819: saturating increment prevents counter overflow.
+                entry.1 = entry.1.saturating_add(1);
+                // #820: record suppression with the alert key for operator correlation.
+                self.suppression_log.borrow_mut().push(
+                    alloc::format!(r#"{{"alert_key":"{}"}}"#, fingerprint)
+                );
+                return false;
             }
+            // Window expired — update entry in place and fire.
+            *entry = (now, 0);
+            return true;
         }
 
-        // Evict oldest entry when at capacity (before inserting).
+        // Key not yet tracked — evict oldest if at capacity, then insert.
         if self.config.max_keys > 0 && map.len() >= self.config.max_keys {
             if let Some(oldest_key) = map.keys().next().cloned() {
                 map.remove(&oldest_key);
             }
         }
 
-        map.insert(fingerprint.into(), now);
+        map.insert(fingerprint.into(), (now, 0));
         true
+    }
+
+    /// Drain and return all buffered suppression log entries.
+    ///
+    /// Each entry is a JSON object containing at least the `alert_key` field
+    /// identifying which fingerprint was suppressed.
+    pub fn drain_suppression_log(&self) -> Vec<String> {
+        self.suppression_log.borrow_mut().drain(..).collect()
     }
 
     /// Forcibly clear the suppression record for `fingerprint`, allowing the
@@ -141,7 +161,12 @@ impl AlertDeduplicator {
 
     /// Return the last-fired timestamp for `fingerprint`, if any.
     pub fn last_fired_at(&self, fingerprint: &str) -> Option<u64> {
-        self.last_fired.borrow().get(fingerprint).copied()
+        self.last_fired.borrow().get(fingerprint).map(|&(ts, _)| ts)
+    }
+
+    /// Return the accumulated suppression count for `fingerprint`, if tracked.
+    pub fn suppress_count_for(&self, fingerprint: &str) -> Option<u64> {
+        self.last_fired.borrow().get(fingerprint).map(|&(_, count)| count)
     }
 
     /// Number of fingerprints currently tracked.
@@ -331,11 +356,15 @@ mod tests {
     }
 
     #[test]
-    fn exactly_at_window_boundary_is_still_suppressed() {
+    fn alert_fires_exactly_at_ttl_boundary() {
         let d = AlertDeduplicator::new(DedupConfig { window_seconds: 300, max_keys: 100 });
         d.should_fire("k1", 1000);
-        // now - last == window_seconds → still suppressed (strict <)
-        assert!(!d.should_fire("k1", 1000 + 300));
+        // now - last == window_seconds → expired, fires (inclusive boundary).
+        assert!(d.should_fire("k1", 1000 + 300));
+        // Just before boundary remains suppressed.
+        let d2 = AlertDeduplicator::new(DedupConfig { window_seconds: 300, max_keys: 100 });
+        d2.should_fire("k1", 1000);
+        assert!(!d2.should_fire("k1", 1000 + 299));
     }
 
     #[test]
@@ -378,6 +407,33 @@ mod tests {
         d.should_fire("k1", 5000);
         assert_eq!(d.last_fired_at("k1"), Some(5000));
         assert_eq!(d.last_fired_at("missing"), None);
+    }
+
+    #[test]
+    fn suppress_count_saturates_at_maximum() {
+        let d = AlertDeduplicator::new(DedupConfig { window_seconds: 9999, max_keys: 100 });
+        assert!(d.should_fire("k1", 1000));
+        assert_eq!(d.suppress_count_for("k1"), Some(0));
+        assert!(!d.should_fire("k1", 1001));
+        assert_eq!(d.suppress_count_for("k1"), Some(1));
+        assert!(!d.should_fire("k1", 1002));
+        assert_eq!(d.suppress_count_for("k1"), Some(2));
+        // Verify saturating_add: u64::MAX + 1 stays at u64::MAX (no wrap).
+        assert_eq!(u64::MAX.saturating_add(1), u64::MAX);
+    }
+
+    #[test]
+    fn suppression_log_includes_alert_key() {
+        let d = AlertDeduplicator::new(DedupConfig { window_seconds: 300, max_keys: 100 });
+        d.should_fire("anchor:example.com:critical", 1000); // fires — no log entry
+        d.should_fire("anchor:example.com:critical", 1100); // suppressed — log entry added
+        let log = d.drain_suppression_log();
+        assert_eq!(log.len(), 1, "exactly one suppression log entry expected");
+        let entry = &log[0];
+        assert!(entry.contains("anchor:example.com:critical"),
+            "suppression log entry must include the alert key");
+        assert!(entry.starts_with('{') && entry.ends_with('}'),
+            "suppression log entry must be a JSON object");
     }
 
     // ── AlertSuppressor ──────────────────────────────────────────────────────
