@@ -314,6 +314,11 @@ fn validate_against_schema(value: &serde_json::Value) -> Result<(), String> {
 #[cfg(feature = "std")]
 pub fn load_runtime_config_file(path: impl AsRef<Path>) -> Result<RuntimeConfig, String> {
     let path = path.as_ref();
+    // Guard: reject a blank path before any filesystem access so callers receive
+    // a clear, configuration-level error rather than an opaque OS error.
+    if path.as_os_str().is_empty() {
+        return Err("config path must not be blank".to_string());
+    }
     let input = fs::read_to_string(path).map_err(|err| err.to_string())?;
     let format = ConfigFormat::from_path(path)?;
     parse_runtime_config_str(&input, format)
@@ -896,5 +901,35 @@ mod hot_reload_tests {
         let path = scratch_path("does_not_exist");
         let result = RuntimeConfigManager::new(&path);
         assert!(result.is_err());
+    }
+
+    // ── #806: blank-path guard ────────────────────────────────────────────────
+
+    #[test]
+    fn test_load_blank_path_returns_clear_error() {
+        // An empty path must be rejected with a configuration-level error
+        // before any filesystem access is attempted.
+        let result = load_runtime_config_file("");
+        assert!(result.is_err(), "blank path must be rejected");
+        let err = result.unwrap_err();
+        assert!(
+            err.contains("blank"),
+            "error message should mention 'blank', got: {err}"
+        );
+    }
+
+    #[test]
+    fn test_load_nonblank_missing_path_returns_io_error() {
+        // A non-blank path that does not exist must still produce an I/O error
+        // (not the blank-path error), preserving the existing error classification.
+        let path = scratch_path("definitely_does_not_exist_nonblank");
+        let result = load_runtime_config_file(&path);
+        assert!(result.is_err(), "missing nonblank path must error");
+        let err = result.unwrap_err();
+        // The error should NOT mention "blank" — it must be an OS I/O error.
+        assert!(
+            !err.contains("blank"),
+            "missing-file error must not say 'blank', got: {err}"
+        );
     }
 }
