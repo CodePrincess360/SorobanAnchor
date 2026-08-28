@@ -197,4 +197,76 @@ mod safe_logging_tests {
         // Ensure the placeholder text is present, not a real key.
         assert!(hint.contains("<SIGNING_KEY_OR_ALIAS>"), "Hint should use a placeholder: {hint}");
     }
+
+    // ── #807: ProxyCredentials debug redaction ────────────────────────────────
+
+    /// `ProxyCredentials` debug output must redact the password and preserve the username.
+    ///
+    /// The safe-logging contract requires that sensitive config fields never
+    /// appear in debug output (test failures, structured logs, panic messages).
+    /// `ProxyCredentials` implements a custom `Debug` that replaces the password
+    /// with `"<redacted>"` while keeping the username inspectable for diagnostics.
+    #[cfg(feature = "std")]
+    #[test]
+    fn test_proxy_credentials_debug_redacts_password() {
+        use anchorkit::config::ProxyCredentials;
+
+        let creds = ProxyCredentials {
+            username: "svc-anchor".to_string(),
+            password: "super-secret-proxy-password".to_string(),
+        };
+
+        let debug_output = format!("{creds:?}");
+
+        // The raw password must not appear in any debug-formatted output.
+        assert!(
+            !debug_output.contains("super-secret-proxy-password"),
+            "Debug must not expose the raw password, got: {debug_output}"
+        );
+
+        // The redaction marker must be present so the field is clearly omitted.
+        assert!(
+            debug_output.contains("<redacted>"),
+            "Debug output must contain '<redacted>' marker, got: {debug_output}"
+        );
+
+        // The username is NOT sensitive and must remain visible for diagnostics.
+        assert!(
+            debug_output.contains("svc-anchor"),
+            "Debug output must keep the username visible, got: {debug_output}"
+        );
+    }
+
+    /// A `ProxyConfig` containing credentials must not expose the password
+    /// anywhere in its debug output.
+    #[cfg(feature = "std")]
+    #[test]
+    fn test_proxy_config_debug_does_not_expose_password() {
+        use anchorkit::config::{ProxyConfig, ProxyCredentials};
+
+        let proxy = ProxyConfig {
+            proxy_url: Some("http://proxy.corp.example.com:3128".to_string()),
+            credentials: Some(ProxyCredentials {
+                username: "svc-anchor".to_string(),
+                password: "s3cret-proxy-pw".to_string(),
+            }),
+            ..ProxyConfig::default()
+        };
+
+        let debug_output = format!("{proxy:?}");
+
+        assert!(
+            !debug_output.contains("s3cret-proxy-pw"),
+            "ProxyConfig debug must not expose the raw password, got: {debug_output}"
+        );
+        assert!(
+            debug_output.contains("<redacted>"),
+            "ProxyConfig debug must contain the redaction marker, got: {debug_output}"
+        );
+        // The proxy URL is not sensitive and should be visible.
+        assert!(
+            debug_output.contains("proxy.corp.example.com"),
+            "ProxyConfig debug should keep the proxy URL visible, got: {debug_output}"
+        );
+    }
 }
