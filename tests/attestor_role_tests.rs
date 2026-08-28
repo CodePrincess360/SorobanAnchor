@@ -590,3 +590,95 @@ mod rate_limit_role_override_tests {
         });
     }
 }
+
+// ── #798 — Reject empty attestor registration identifier ─────────────────────
+
+#[cfg(test)]
+mod empty_attestor_registration_tests {
+    use soroban_sdk::{
+        testutils::{Address as _, Ledger, LedgerInfo},
+        Address, Env, String,
+    };
+
+    use anchorkit::contract::{AnchorKitContract, AnchorKitContractClient};
+
+    fn make_env() -> Env {
+        let env = Env::default();
+        env.mock_all_auths();
+        env.ledger().set(LedgerInfo {
+            timestamp: 1_000_000,
+            protocol_version: 21,
+            sequence_number: 0,
+            network_id: Default::default(),
+            base_reserve: 0,
+            min_persistent_entry_ttl: 4096,
+            min_temp_entry_ttl: 16,
+            max_entry_ttl: 6_312_000,
+        });
+        env
+    }
+
+    fn setup(env: &Env) -> AnchorKitContractClient {
+        let contract_id = env.register_contract(None, AnchorKitContract);
+        let client = AnchorKitContractClient::new(env, &contract_id);
+        let admin = Address::generate(env);
+        client.initialize(&admin);
+        client
+    }
+
+    /// An empty SEP-10 token must be rejected before any state mutation.
+    #[test]
+    fn empty_sep10_token_is_rejected() {
+        let env = make_env();
+        let client = setup(&env);
+
+        let attestor = Address::generate(&env);
+        let issuer = Address::generate(&env);
+        let empty_token = String::from_str(&env, "");
+        let pk = soroban_sdk::BytesN::from_array(&env, &[0u8; 32]);
+
+        let result = client.try_register_attestor(&attestor, &empty_token, &issuer, &pk);
+        assert!(
+            result.is_err(),
+            "expected registration to be rejected with an empty sep10_token, but it succeeded"
+        );
+
+        // The attestor must not have been registered despite the call.
+        assert!(
+            !client.is_attestor(&attestor),
+            "attestor must not be registered after a failed call"
+        );
+    }
+
+    /// A valid token must still register successfully (regression guard).
+    ///
+    /// NOTE: This test uses mock_all_auths so it bypasses actual JWT
+    /// verification; it only confirms the empty-string guard does not
+    /// incorrectly block non-empty tokens.
+    #[test]
+    fn non_empty_sep10_token_passes_blank_guard() {
+        let env = make_env();
+        let client = setup(&env);
+
+        let attestor = Address::generate(&env);
+        let issuer = Address::generate(&env);
+        // A minimal non-empty string — JWT verification is mocked out.
+        let token = String::from_str(&env, "eyJhbGciOiJFZERTQSJ9.e30.sig");
+        let pk = soroban_sdk::BytesN::from_array(&env, &[0u8; 32]);
+
+        // With mock_all_auths, JWT verification is skipped, so this should succeed.
+        let result = client.try_register_attestor(&attestor, &token, &issuer, &pk);
+        // We accept either Ok (mocked env skips JWT check) or Err from JWT
+        // verification — the important thing is it did NOT fail with
+        // InvalidRegistration due to the blank-guard.
+        // We specifically check it's NOT the InvalidRegistration error (code 77).
+        if let Err(e) = result {
+            let code = e.unwrap();
+            assert_ne!(
+                code,
+                anchorkit::errors::ErrorCode::InvalidRegistration,
+                "non-empty token must not be rejected by the blank-field guard"
+            );
+        }
+    }
+}

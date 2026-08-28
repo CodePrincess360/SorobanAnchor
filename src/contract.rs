@@ -1720,6 +1720,12 @@ const MAX_JWT_MAX_LEN: u32 = 16384;
 /// Default lifetime for an approved KYC record before the approval expires.
 const KYC_EXPIRY_SECONDS: u64 = 30 * 24 * 60 * 60; // 30 days
 
+/// Maximum validity window for a submitted quote (30 days in seconds).
+/// Quotes whose `valid_until` field exceeds `now + MAX_QUOTE_VALIDITY_SECONDS`
+/// are rejected to prevent unbounded validity windows that make routing
+/// unpredictable.
+const MAX_QUOTE_VALIDITY_SECONDS: u64 = 30 * 24 * 60 * 60;
+
 fn current_kyc_status(env: &Env, record: &KycRecord) -> KycStatus {
     if let Some(expiry) = record.expiry {
         if env.ledger().timestamp() > expiry {
@@ -3198,6 +3204,12 @@ impl AnchorKitContract {
     /// AnchorKitContract::register_attestor(env, attestor, token, issuer, pubkey);
     /// ```
     pub fn register_attestor(env: Env, attestor: Address, sep10_token: String, sep10_issuer: Address, public_key: BytesN<32>) {
+        // Reject a blank SEP-10 token immediately — an empty identifier makes
+        // authentication impossible to diagnose and would cause a confusing
+        // JWT-verification error later.  Fail fast before any state mutation.
+        if sep10_token.len() == 0 {
+            panic_with_error!(&env, ErrorCode::InvalidRegistration);
+        }
         // Accept via primary admin, AttestorAdmin role, OR ManageAttestors capability.
         if !Self::has_role_internal(&env, &attestor, AdminRole::AttestorAdmin)
             && !Self::has_capability_internal(&env, &attestor, AdminCapability::ManageAttestors)
@@ -5043,6 +5055,13 @@ impl AnchorKitContract {
         filter: Option<AttestationFilter>,
     ) -> AttestationPage {
         const PAGE_CAP: u64 = 50;
+
+        // #800: reject a zero limit — it produces an ambiguous empty page that
+        // is indistinguishable from a genuine end-of-results signal.
+        if limit == 0 {
+            panic_with_error!(&env, ErrorCode::ValidationError);
+        }
+
         let effective_limit = limit.min(PAGE_CAP);
 
         // Read the global ATIDX index — it holds every attestation ID in
@@ -5056,6 +5075,17 @@ impl AnchorKitContract {
             .unwrap_or_else(|| Vec::new(&env));
 
         let total = all_ids.len() as u64;
+
+        // #799: a cursor equal to or beyond the collection boundary returns an
+        // empty page immediately, preventing index underflow in the range arithmetic
+        // below.
+        if offset >= total {
+            return AttestationPage {
+                records: Vec::new(&env),
+                next_offset: total,
+                total,
+            };
+        }
         let mut records = Vec::new(&env);
         let mut skipped: u64 = 0;
         let mut next_offset = total; // default: last page
@@ -5675,8 +5705,7 @@ impl AnchorKitContract {
         }
         // Reject quotes expiring more than 30 days in the future to prevent
         // unbounded validity windows that make routing unpredictable.
-        const MAX_QUOTE_VALIDITY: u64 = 30 * 24 * 60 * 60;
-        if valid_until.saturating_sub(now) > MAX_QUOTE_VALIDITY {
+        if valid_until.saturating_sub(now) > MAX_QUOTE_VALIDITY_SECONDS {
             panic_with_error!(&env, ErrorCode::InvalidQuote);
         }
         let inst = env.storage().instance();
