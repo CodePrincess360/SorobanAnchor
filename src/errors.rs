@@ -141,13 +141,19 @@ pub enum ErrorCode {
     /// Amount is zero or otherwise invalid for routing.
     InvalidAmount             = 64,
 
-    // Maintenance window errors (65–67)
+    // Precise retirement / fingerprint errors (65–66)
+    /// A service retirement transition is invalid (e.g. from/to state labels).
+    InvalidRetirementTransition = 65,
+    /// Fingerprint collection failed.
+    FingerprintCollectionFailed = 66,
+
+    // Maintenance window errors (77–79)
     /// No maintenance window exists for the requested ID.
-    MaintenanceWindowNotFound = 65,
+    MaintenanceWindowNotFound = 77,
     /// A new maintenance window conflicts with an existing one for the same anchor.
-    MaintenanceWindowConflict = 66,
+    MaintenanceWindowConflict = 78,
     /// The requested operation is blocked because the anchor is in a maintenance window.
-    ServiceInMaintenance      = 67,
+    ServiceInMaintenance      = 79,
 
     // Dependency graph errors (68–70)
     /// A required service dependency is not present or not enabled.

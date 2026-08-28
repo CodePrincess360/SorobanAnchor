@@ -59,6 +59,24 @@ pub enum ProvenanceError {
     /// whitespace. Every provenance record must be attributable to a named
     /// actor so audit logs can be filtered by origin.
     EmptyActor,
+    /// Metadata exceeds the maximum allowed length (`MAX_METADATA_LEN`).
+    MetadataTooLong {
+        len: usize,
+        max: usize,
+    },
+}
+
+impl core::fmt::Display for ProvenanceError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            ProvenanceError::EmptyActor => {
+                write!(f, "provenance actor (origin service) must not be empty")
+            }
+            ProvenanceError::MetadataTooLong { len, max } => {
+                write!(f, "provenance metadata length {len} exceeds limit of {max} bytes")
+            }
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -70,26 +88,6 @@ pub const MAX_METADATA_LEN: usize = 1024;
 
 /// Backward-compatible alias for [`MAX_METADATA_LEN`].
 pub const MAX_METADATA_LENGTH: usize = MAX_METADATA_LEN;
-
-/// Errors that can arise during provenance validation or construction.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum ProvenanceError {
-    /// Metadata exceeds the maximum allowed length (`MAX_METADATA_LEN`).
-    MetadataTooLong {
-        len: usize,
-        max: usize,
-    },
-}
-
-impl core::fmt::Display for ProvenanceError {
-    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        match self {
-            ProvenanceError::MetadataTooLong { len, max } => {
-                write!(f, "provenance metadata length {len} exceeds limit of {max} bytes")
-            }
-        }
-    }
-}
 
 /// Provenance and lineage record for a single request.
 ///
@@ -179,7 +177,7 @@ impl ProvenanceRecord {
         metadata: impl Into<String>,
         created_at: u64,
     ) -> Result<Self, ProvenanceError> {
-        let root = Self::root(origin_service, operation, created_at);
+        let root = Self::root(origin_service, operation, created_at)?;
         root.with_metadata(metadata)
     }
 
@@ -262,7 +260,7 @@ impl ProvenanceRecord {
         metadata: impl Into<String>,
         created_at: u64,
     ) -> Result<Self, ProvenanceError> {
-        let child = self.child(child_service, operation, created_at);
+        let child = self.child(child_service, operation, created_at)?;
         child.with_metadata(metadata)
     }
 
