@@ -331,11 +331,15 @@ mod tests {
     }
 
     #[test]
-    fn exactly_at_window_boundary_is_still_suppressed() {
+    fn alert_fires_exactly_at_ttl_boundary() {
         let d = AlertDeduplicator::new(DedupConfig { window_seconds: 300, max_keys: 100 });
         d.should_fire("k1", 1000);
-        // now - last == window_seconds → still suppressed (strict <)
-        assert!(!d.should_fire("k1", 1000 + 300));
+        // now - last == window_seconds → expired, fires (inclusive boundary).
+        assert!(d.should_fire("k1", 1000 + 300));
+        // Just before boundary remains suppressed.
+        let d2 = AlertDeduplicator::new(DedupConfig { window_seconds: 300, max_keys: 100 });
+        d2.should_fire("k1", 1000);
+        assert!(!d2.should_fire("k1", 1000 + 299));
     }
 
     #[test]
