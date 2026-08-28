@@ -400,6 +400,34 @@ mod event_emission_tests {
 
         assert!(after > before, "attest.recorded event must be emitted");
     }
+
+    // -----------------------------------------------------------------------
+    // #797 — Repeated revocation does not emit a second transition event
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_repeated_revocation_emits_no_extra_event() {
+        let env = make_env();
+        let (client, _, issuer, _) = setup(&env);
+
+        // First revocation: event count must increase.
+        let before_first = env.events().all().len();
+        client.revoke_attestor(&issuer);
+        let after_first = env.events().all().len();
+        assert!(after_first > before_first, "first revocation must emit the transition event");
+
+        // Second revocation: must fail (attestor no longer registered).
+        let events_snapshot = env.events().all().len();
+        let result = client.try_revoke_attestor(&issuer);
+        assert!(result.is_err(), "repeated revocation must return an error");
+
+        // No additional event should have been emitted.
+        assert_eq!(
+            env.events().all().len(),
+            events_snapshot,
+            "repeated revocation must not emit an extra transition event",
+        );
+    }
 }
 
 mod error_propagation_tests {

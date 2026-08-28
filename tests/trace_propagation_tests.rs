@@ -19,7 +19,7 @@ mod trace_propagation_tests {
         http_client::{post_with_options, OutboundRequestOptions},
         retry::{retry_with_backoff_traced, MockJitterSource, RetryConfig},
         streaming_monitor::{PollResult, StreamingTransactionMonitor},
-        trace_context::TraceContext,
+        trace_context::{TraceContext, TraceError},
         transaction_state_tracker::TransactionState,
         webhook::{
             deliver_webhook, deliver_webhook_traced, dlq_entries_for_trace,
@@ -395,7 +395,37 @@ mod trace_propagation_tests {
     }
 
     // -----------------------------------------------------------------------
-    // 5. Background monitoring
+    // 5. All-zero trace ID validation
+    // -----------------------------------------------------------------------
+
+    /// All-zero trace IDs are rejected by the parser as semantically invalid,
+    /// preventing silent trace correlation breakage.
+    #[test]
+    fn all_zero_trace_id_is_rejected() {
+        let all_zero_trace = "0".repeat(32);
+        let valid_span = "00f067aa0ba902b7";
+        
+        // Direct construction should reject all-zero trace ID
+        let result = TraceContext::new(&all_zero_trace, valid_span, None, true);
+        assert_eq!(result, Err(TraceError::InvalidTraceId));
+        
+        // Traceparent parsing should also reject all-zero trace ID
+        let traceparent_with_zero_trace = format!("00-{}-{}-01", all_zero_trace, valid_span);
+        let parse_result = TraceContext::parse_traceparent(&traceparent_with_zero_trace);
+        assert_eq!(parse_result, Err(TraceError::InvalidTraceId));
+        
+        // But valid non-zero trace IDs of the same length should still be accepted
+        let valid_trace = "4bf92f3577b34da6a3ce929d0e0e4736";
+        let valid_context = TraceContext::new(valid_trace, valid_span, None, true);
+        assert!(valid_context.is_ok());
+        
+        let valid_traceparent = format!("00-{}-{}-01", valid_trace, valid_span);
+        let valid_parse = TraceContext::parse_traceparent(&valid_traceparent);
+        assert!(valid_parse.is_ok());
+    }
+
+    // -----------------------------------------------------------------------
+    // 6. Background monitoring
     // -----------------------------------------------------------------------
 
     /// A long-running monitor keeps the request's trace across many poll cycles.

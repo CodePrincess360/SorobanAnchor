@@ -106,6 +106,26 @@ mod attestation_sig_tests {
     }
 
     // -----------------------------------------------------------------------
+    // Zero timestamp rejected (#794)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_zero_timestamp_rejected() {
+        let env = make_env();
+        let (client, attestor, sk) = setup(&env);
+        let subject = Address::generate(&env);
+
+        let ph = payload(&env, 0xAB);
+        let sig = sign_payload(&env, &sk, &ph);
+
+        let result = client.try_submit_attestation(&attestor, &subject, &0u64, &ph, &sig);
+        assert_eq!(
+            result.unwrap_err().unwrap(),
+            anchorkit::errors::ErrorCode::InvalidTimestamp,
+        );
+    }
+
+    // -----------------------------------------------------------------------
     // Revoked attestor's signature rejected
     // -----------------------------------------------------------------------
 

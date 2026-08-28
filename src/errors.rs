@@ -178,6 +178,12 @@ pub enum ErrorCode {
     InvalidSloConfig          = 75,
     /// No SLO has been configured for this anchor.
     SloNotConfigured          = 76,
+
+    // Retirement transition errors (77-78)
+    /// The requested retirement transition is invalid for the current state.
+    InvalidRetirementTransition = 77,
+    /// Environment fingerprint collection failed.
+    FingerprintCollectionFailed = 78,
 }
 
 impl ErrorCode {
@@ -262,6 +268,8 @@ impl ErrorCode {
             ErrorCode::SloViolation              => "Service level objective was violated",
             ErrorCode::InvalidSloConfig          => "SLO configuration is invalid",
             ErrorCode::SloNotConfigured          => "No SLO has been configured for this anchor",
+            ErrorCode::InvalidRetirementTransition => "Invalid retirement transition for current state",
+            ErrorCode::FingerprintCollectionFailed => "Environment fingerprint collection failed",
         }
     }
 }
@@ -448,7 +456,7 @@ impl AnchorKitError {
         Self::with_context(
             ErrorCode::InvalidRetirementTransition,
             ErrorCode::InvalidRetirementTransition.default_message(),
-            &alloc::format!("[E65] {} -> {}", from, to),
+            &alloc::format!("[E77] {} -> {}", from, to),
         )
     }
     pub fn batch_size_exceeded(limit: usize, given: usize) -> Self {
@@ -758,8 +766,8 @@ mod tests {
         assert_eq!(ErrorCode::QuoteExpired          as u32, 60);
         assert_eq!(ErrorCode::SignatureVerificationFailed as u32, 61);
         assert_eq!(ErrorCode::BatchSizeExceeded     as u32, 62);
-        assert_eq!(ErrorCode::InvalidRetirementTransition as u32, 65);
-        assert_eq!(ErrorCode::FingerprintCollectionFailed as u32, 66);
+        assert_eq!(ErrorCode::InvalidRetirementTransition as u32, 77);
+        assert_eq!(ErrorCode::FingerprintCollectionFailed as u32, 78);
     }
 
     #[test]

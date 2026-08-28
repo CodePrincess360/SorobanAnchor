@@ -5,13 +5,15 @@ mod sep10_test_util;
 mod capacity_limits_tests {
     use soroban_sdk::{
         testutils::{Address as _, Ledger, LedgerInfo},
-        Address, Env, String,
+        Address, Bytes, Env, String,
     };
 
     use anchorkit::contract::{
         AnchorKitContract, AnchorKitContractClient, AnchorMetadata, CapacityConfig,
+        MAX_PAYLOAD_HASH_BYTES,
     };
-    use crate::sep10_test_util::register_attestor_with_sep10;
+    use anchorkit::errors::ErrorCode;
+    use crate::sep10_test_util::{register_attestor_with_sep10, sign_payload};
     use ed25519_dalek::SigningKey;
 
     fn make_env() -> Env {
@@ -162,5 +164,82 @@ mod capacity_limits_tests {
         updated_meta.reputation_score = 9500;
         client.cache_metadata(&anchor, &updated_meta, &3600u64);
         assert_eq!(client.get_cache_count(), 1);
+    }
+
+    // -----------------------------------------------------------------------
+    // #795 — Oversized payload hash rejected before state mutation
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_oversized_payload_hash_rejected() {
+        let env = make_env();
+        set_ledger(&env, 1_000_000);
+        let contract_id = env.register_contract(None, AnchorKitContract);
+        let client = AnchorKitContractClient::new(&env, &contract_id);
+
+        let admin = Address::generate(&env);
+        client.initialize(&admin);
+
+        let sk = SigningKey::from(&[3u8; 32]);
+        let attestor = Address::generate(&env);
+        register_attestor_with_sep10(&env, &client, &attestor, &attestor, &sk);
+
+        let subject = Address::generate(&env);
+
+        // At-limit (32 bytes) should succeed
+        let mut at_limit = Bytes::new(&env);
+        for i in 0..MAX_PAYLOAD_HASH_BYTES {
+            at_limit.push_back(i as u8);
+        }
+        let sig_ok = sign_payload(&env, &sk, &at_limit);
+        let result = client.try_submit_attestation(&attestor, &subject, &1_000_001u64, &at_limit, &sig_ok);
+        assert!(result.is_ok(), "at-limit payload hash must be accepted");
+
+        // Over-limit (33 bytes) must be rejected before any state write
+        let mut over_limit = at_limit.clone();
+        over_limit.push_back(0xFF);
+        let sig_bad = sign_payload(&env, &sk, &over_limit);
+        let result = client.try_submit_attestation(&attestor, &subject, &1_000_002u64, &over_limit, &sig_bad);
+        assert_eq!(
+            result.unwrap_err().unwrap(),
+            ErrorCode::ValidationError,
+            "over-limit payload must fail with ValidationError",
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // #796 — Attestation sequence counter must not wrap at u64::MAX
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_attestation_id_overflow_rejected() {
+        let env = make_env();
+        set_ledger(&env, 1_000_000);
+        let contract_id = env.register_contract(None, AnchorKitContract);
+        let client = AnchorKitContractClient::new(&env, &contract_id);
+
+        let admin = Address::generate(&env);
+        client.initialize(&admin);
+
+        // Seed the COUNTER to u64::MAX so the next allocation would overflow.
+        env.as_contract(&contract_id, || {
+            let ck = soroban_sdk::vec![&env, soroban_sdk::symbol_short!("COUNTER")];
+            env.storage().instance().set(&ck, &u64::MAX);
+        });
+
+        let sk = SigningKey::from(&[4u8; 32]);
+        let attestor = Address::generate(&env);
+        register_attestor_with_sep10(&env, &client, &attestor, &attestor, &sk);
+
+        let subject = Address::generate(&env);
+        let mut ph = Bytes::new(&env);
+        for i in 0u8..32 { ph.push_back(i); }
+        let sig = sign_payload(&env, &sk, &ph);
+
+        let result = client.try_submit_attestation(&attestor, &subject, &1_000_001u64, &ph, &sig);
+        assert!(
+            result.is_err(),
+            "submission at counter u64::MAX must fail to prevent ID wrap",
+        );
     }
 }

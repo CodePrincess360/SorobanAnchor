@@ -1709,6 +1709,9 @@ pub const MAX_OPS_PER_SESSION: u64 = 100;
 /// Minimum TTL for replay-protection entries (7 days in ledgers at ~5 s/ledger).
 pub const REPLAY_TTL: u32 = 120_960;
 
+/// Maximum accepted byte length for an attestation payload hash (SHA-256 = 32 bytes).
+pub const MAX_PAYLOAD_HASH_BYTES: u32 = 32;
+
 /// Inclusive lower bound for the configurable JWT max-length (set_jwt_max_len).
 const MIN_JWT_MAX_LEN: u32 = 2048;
 /// Inclusive upper bound for the configurable JWT max-length (set_jwt_max_len).
@@ -1716,6 +1719,12 @@ const MAX_JWT_MAX_LEN: u32 = 16384;
 
 /// Default lifetime for an approved KYC record before the approval expires.
 const KYC_EXPIRY_SECONDS: u64 = 30 * 24 * 60 * 60; // 30 days
+
+/// Maximum validity window for a submitted quote (30 days in seconds).
+/// Quotes whose `valid_until` field exceeds `now + MAX_QUOTE_VALIDITY_SECONDS`
+/// are rejected to prevent unbounded validity windows that make routing
+/// unpredictable.
+const MAX_QUOTE_VALIDITY_SECONDS: u64 = 30 * 24 * 60 * 60;
 
 fn current_kyc_status(env: &Env, record: &KycRecord) -> KycStatus {
     if let Some(expiry) = record.expiry {
@@ -3195,6 +3204,12 @@ impl AnchorKitContract {
     /// AnchorKitContract::register_attestor(env, attestor, token, issuer, pubkey);
     /// ```
     pub fn register_attestor(env: Env, attestor: Address, sep10_token: String, sep10_issuer: Address, public_key: BytesN<32>) {
+        // Reject a blank SEP-10 token immediately — an empty identifier makes
+        // authentication impossible to diagnose and would cause a confusing
+        // JWT-verification error later.  Fail fast before any state mutation.
+        if sep10_token.len() == 0 {
+            panic_with_error!(&env, ErrorCode::InvalidRegistration);
+        }
         // Accept via primary admin, AttestorAdmin role, OR ManageAttestors capability.
         if !Self::has_role_internal(&env, &attestor, AdminRole::AttestorAdmin)
             && !Self::has_capability_internal(&env, &attestor, AdminCapability::ManageAttestors)
@@ -3316,6 +3331,17 @@ impl AnchorKitContract {
             .get(&pk_key)
             .unwrap_or_else(|| panic_with_error!(&env, ErrorCode::AttestorNotRegistered));
 
+        // Capture whether this is a genuine active→revoked transition before any
+        // writes. An existing record with reactivated=false means the attestor is
+        // already revoked (edge case guard); no event should fire in that case.
+        let revoc_key = (symbol_short!("ATREVOC"), attestor.clone());
+        let already_revoked = env
+            .storage()
+            .persistent()
+            .get::<_, AttestorRevocationRecord>(&revoc_key)
+            .map(|r| !r.reactivated)
+            .unwrap_or(false);
+
         // Remove the active registration keys so `check_attestor` / `is_attestor`
         // start returning false immediately.
         env.storage().persistent().remove(&key);
@@ -3333,7 +3359,6 @@ impl AnchorKitContract {
             reactivated: false,
             reactivated_at: 0,
         };
-        let revoc_key = (symbol_short!("ATREVOC"), attestor.clone());
         env.storage().persistent().set(&revoc_key, &revoc_record);
         env.storage()
             .persistent()
@@ -3362,10 +3387,12 @@ impl AnchorKitContract {
             "revoked",
         );
 
-        env.events().publish(
-            (symbol_short!("attestor"), symbol_short!("removed"), attestor.clone()),
-            AttestorRevokedEvent { attestor, revoked_by: admin, timestamp: env.ledger().timestamp() },
-        );
+        if !already_revoked {
+            env.events().publish(
+                (symbol_short!("attestor"), symbol_short!("removed"), attestor.clone()),
+                AttestorRevokedEvent { attestor, revoked_by: admin, timestamp: env.ledger().timestamp() },
+            );
+        }
     }
 
     /// Reactivate an attestor that was previously revoked.
@@ -4257,7 +4284,7 @@ impl AnchorKitContract {
     /// [`AdminCapability::ToggleServices`].
     pub fn enable_service(env: Env, caller: Address, anchor: Address, service_code: u32) -> bool {
         Self::require_admin_or_capability(&env, &caller, AdminCapability::ToggleServices);
-        let changed = ServiceManager::enable_service(&env, &anchor, service_code);
+        let changed = ServiceManager::enable_service(&env, &anchor, service_code).unwrap_or(false);
         AdminAuditLog::log_action(
             &env,
             &caller,
@@ -4278,7 +4305,7 @@ impl AnchorKitContract {
     /// [`AdminCapability::ToggleServices`].
     pub fn disable_service(env: Env, caller: Address, anchor: Address, service_code: u32) -> bool {
         Self::require_admin_or_capability(&env, &caller, AdminCapability::ToggleServices);
-        let changed = ServiceManager::disable_service(&env, &anchor, service_code);
+        let changed = ServiceManager::disable_service(&env, &anchor, service_code).unwrap_or(false);
         AdminAuditLog::log_action(
             &env,
             &caller,
@@ -4386,6 +4413,9 @@ impl AnchorKitContract {
         // function panics before any storage mutation occurs, leaving the
         // contract in a consistent state.
         issuer.require_auth();
+        if payload_hash.len() > MAX_PAYLOAD_HASH_BYTES {
+            panic_with_error!(&env, ErrorCode::ValidationError);
+        }
         Self::check_attestor(&env, &issuer);
         Self::verify_attestation_signature(&env, &issuer, &payload_hash, &signature);
         Self::check_timestamp(&env, timestamp);
@@ -5025,6 +5055,13 @@ impl AnchorKitContract {
         filter: Option<AttestationFilter>,
     ) -> AttestationPage {
         const PAGE_CAP: u64 = 50;
+
+        // #800: reject a zero limit — it produces an ambiguous empty page that
+        // is indistinguishable from a genuine end-of-results signal.
+        if limit == 0 {
+            panic_with_error!(&env, ErrorCode::ValidationError);
+        }
+
         let effective_limit = limit.min(PAGE_CAP);
 
         // Read the global ATIDX index — it holds every attestation ID in
@@ -5038,6 +5075,17 @@ impl AnchorKitContract {
             .unwrap_or_else(|| Vec::new(&env));
 
         let total = all_ids.len() as u64;
+
+        // #799: a cursor equal to or beyond the collection boundary returns an
+        // empty page immediately, preventing index underflow in the range arithmetic
+        // below.
+        if offset >= total {
+            return AttestationPage {
+                records: Vec::new(&env),
+                next_offset: total,
+                total,
+            };
+        }
         let mut records = Vec::new(&env);
         let mut skipped: u64 = 0;
         let mut next_offset = total; // default: last page
@@ -5657,8 +5705,7 @@ impl AnchorKitContract {
         }
         // Reject quotes expiring more than 30 days in the future to prevent
         // unbounded validity windows that make routing unpredictable.
-        const MAX_QUOTE_VALIDITY: u64 = 30 * 24 * 60 * 60;
-        if valid_until.saturating_sub(now) > MAX_QUOTE_VALIDITY {
+        if valid_until.saturating_sub(now) > MAX_QUOTE_VALIDITY_SECONDS {
             panic_with_error!(&env, ErrorCode::InvalidQuote);
         }
         let inst = env.storage().instance();
@@ -9240,6 +9287,9 @@ impl AnchorKitContract {
         let inst = env.storage().instance();
         let ck = soroban_sdk::vec![env, symbol_short!("COUNTER")];
         let id: u64 = inst.get(&ck).unwrap_or(0u64);
+        if id == u64::MAX {
+            panic_with_error!(env, ErrorCode::AttestorCapacityExceeded);
+        }
         inst.set(&ck, &(id + 1));
         inst.extend_ttl(INSTANCE_TTL, INSTANCE_TTL);
         id
