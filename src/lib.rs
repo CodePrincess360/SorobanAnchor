@@ -162,6 +162,8 @@ pub mod config;
 pub mod env_fingerprint;
 #[cfg(feature = "std")]
 pub use env_fingerprint::EnvironmentFingerprint;
+#[cfg(feature = "std")]
+pub use env_fingerprint::{EnvironmentFingerprintId, LocalFingerprintId};
 
 // ── Host-only modules (HTTP, threading) ───────────────────────────────────────
 // Excluded from `wasm` builds: on-chain Soroban contracts have no network access.

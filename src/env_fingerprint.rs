@@ -30,6 +30,7 @@
 use std::collections::HashMap;
 use std::process::Command;
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 
 // ---------------------------------------------------------------------------
 // ToolVersions
@@ -76,8 +77,6 @@ pub struct ConfigMetadata {
 impl ConfigMetadata {
     /// Hash every `.json` and `.toml` file found in `configs/`.
     pub fn collect() -> Self {
-        use sha2::{Digest, Sha256};
-
         let config_dir = std::path::Path::new("configs");
         let mut file_hashes = HashMap::new();
 
@@ -409,6 +408,151 @@ fn diff_opt(items: &mut Vec<DriftItem>, field: &str, current: &Option<String>, b
             current.as_deref().unwrap_or("<none>"),
         ));
     }
+}
+
+// ---------------------------------------------------------------------------
+// EnvironmentFingerprintId (#808)
+// ---------------------------------------------------------------------------
+
+/// A compact SHA-256-based identity token for a named, versioned environment.
+///
+/// The fingerprint is derived by hashing the canonical concatenation of the
+/// environment `name` and `version`, separated by `"||"`:
+/// `SHA-256(name || "||" || version)`
+///
+/// Both fields are required to be non-empty; a blank name or version is
+/// rejected with a descriptive error before any hashing takes place.
+///
+/// # Examples
+///
+/// ```rust,no_run
+/// use anchorkit::env_fingerprint::EnvironmentFingerprintId;
+///
+/// let id = EnvironmentFingerprintId::new("mainnet", "1.2.3").unwrap();
+/// assert!(!id.hex().is_empty());
+/// ```
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct EnvironmentFingerprintId {
+    /// The environment name supplied at construction (stored for diagnostics).
+    pub name: String,
+    /// The environment version supplied at construction (stored for diagnostics).
+    pub version: String,
+    /// Lower-case hex SHA-256 digest of `"<name>||<version>"`.
+    hex: String,
+}
+
+impl EnvironmentFingerprintId {
+    /// Construct a new `EnvironmentFingerprintId` from `name` and `version`.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err` when either `name` or `version` is blank (empty or
+    /// whitespace-only).  Blank components cause fingerprint collisions across
+    /// deployments and weaken diagnostics, so they are rejected here rather
+    /// than silently producing an ambiguous hash.
+    pub fn new(name: &str, version: &str) -> Result<Self, String> {
+        if name.trim().is_empty() {
+            return Err("environment name must not be blank".to_string());
+        }
+        if version.trim().is_empty() {
+            return Err("environment version must not be blank".to_string());
+        }
+        let hex = Self::compute_hex(name, version);
+        Ok(Self {
+            name: name.to_string(),
+            version: version.to_string(),
+            hex,
+        })
+    }
+
+    /// Return the lower-case hex SHA-256 digest for this fingerprint.
+    pub fn hex(&self) -> &str {
+        &self.hex
+    }
+
+    /// Compute `SHA-256(name || "||" || version)` and return as a lower-case
+    /// hex string.  The canonical field order is always `name` first, then
+    /// `version`; this must never be reversed.
+    fn compute_hex(name: &str, version: &str) -> String {
+        compute_fingerprint_hex(name, version)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// LocalFingerprintId (#809)
+// ---------------------------------------------------------------------------
+//
+// A host-side (no_std-incompatible) fingerprint that uses the same canonical
+// `name || "||" || version` field order as `EnvironmentFingerprintId`, but is
+// constructed from owned `String` fields and provides an alternative entry
+// point for callers that already own their strings.
+//
+// The canonical order (name first, version second) is the single established
+// order used across all construction paths.  Do not reverse it.
+
+/// A host-side canonical environment fingerprint with explicit `name||version`
+/// field ordering.
+///
+/// Uses the same `SHA-256(name || "||" || version)` computation as
+/// [`EnvironmentFingerprintId`].  The canonical field order is always
+/// `name` before `version` across every construction path, ensuring that
+/// equivalent environment data always produces the same fingerprint regardless
+/// of which constructor was called.
+///
+/// # Examples
+///
+/// ```rust,no_run
+/// use anchorkit::env_fingerprint::LocalFingerprintId;
+///
+/// let fp = LocalFingerprintId::new("testnet".to_string(), "2.0.0".to_string()).unwrap();
+/// // Same result as EnvironmentFingerprintId::new("testnet", "2.0.0")
+/// assert_eq!(fp.hex().len(), 64);
+/// ```
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LocalFingerprintId {
+    /// The environment name.
+    pub name: String,
+    /// The environment version.
+    pub version: String,
+    /// Lower-case hex SHA-256 of `"<name>||<version>"`.
+    hex: String,
+}
+
+impl LocalFingerprintId {
+    /// Construct a `LocalFingerprintId` from owned strings.
+    ///
+    /// Rejects blank (empty / whitespace-only) name or version with a
+    /// descriptive error, for the same reason as [`EnvironmentFingerprintId::new`].
+    pub fn new(name: String, version: String) -> Result<Self, String> {
+        if name.trim().is_empty() {
+            return Err("environment name must not be blank".to_string());
+        }
+        if version.trim().is_empty() {
+            return Err("environment version must not be blank".to_string());
+        }
+        // Canonical order: name first, then version.
+        let hex = compute_fingerprint_hex(&name, &version);
+        Ok(Self { name, version, hex })
+    }
+
+    /// Return the lower-case hex SHA-256 digest for this fingerprint.
+    pub fn hex(&self) -> &str {
+        &self.hex
+    }
+}
+
+/// Shared inner implementation: `SHA-256(name || "||" || version)`.
+///
+/// The field order is fixed and canonical: `name` is always hashed before
+/// `version`.  All construction paths must use this function so there is no
+/// risk of one path accidentally reversing the order.
+fn compute_fingerprint_hex(name: &str, version: &str) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(name.as_bytes());
+    hasher.update(b"||");
+    hasher.update(version.as_bytes());
+    let digest = hasher.finalize();
+    digest.iter().map(|b| format!("{:02x}", b)).collect()
 }
 
 // ---------------------------------------------------------------------------
