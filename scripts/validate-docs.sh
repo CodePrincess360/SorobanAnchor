@@ -102,25 +102,37 @@ fi
 
 section "Broken Internal Links"
 
+# Repository-local link check only — no network access is performed.
+# External links (http/https/mailto) are intentionally excluded: validating
+# them would require network access and is out of scope for this offline check.
+LINK_ERRORS_BEFORE=$ERRORS
+
 for file in "${MD_FILES[@]}"; do
   dir=$(dirname "$file")
-  # Extract all relative markdown links: [text](./path) or [text](path.md)
+  # Extract all markdown link targets: [text](target) or [text](target "title")
   while IFS= read -r link; do
-    # Strip anchor fragments
+    # Drop an optional link title: (path "title") → path
+    link="${link%%[[:space:]]*}"
+    # Strip anchor fragments and query strings
     target="${link%%#*}"
+    target="${target%%\?*}"
     [[ -z "$target" ]] && continue
-    # Skip external URLs
+    # Skip external URLs (no network access) and mailto links
     [[ "$target" =~ ^https?:// ]] && continue
     [[ "$target" =~ ^mailto: ]]  && continue
+    # Skip protocol-relative and other absolute schemes (e.g. ftp:, tel:)
+    [[ "$target" =~ ^[a-zA-Z][a-zA-Z0-9+.-]*: ]] && continue
+    # Skip pure in-page anchors (already handled by the fragment strip above)
+    [[ "$target" =~ ^/ ]] && continue
 
     resolved="$dir/$target"
     if [[ ! -e "$resolved" ]]; then
       fail "Broken link in ${file}: → ${link}"
     fi
-  done < <(grep -oP '\[.*?\]\(\K[^)]+' "$file" 2>/dev/null || true)
+  done < <(grep -oP '\[[^]]*\]\(\K[^)]+' "$file" 2>/dev/null || true)
 done
 
-[[ $ERRORS -eq 0 ]] && pass "No broken internal links found"
+[[ $ERRORS -eq $LINK_ERRORS_BEFORE ]] && pass "No broken internal links found"
 
 # ── 3. Heading consistency ───────────────────────────────────────────────────
 

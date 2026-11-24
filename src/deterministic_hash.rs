@@ -18,6 +18,59 @@
 //! Timestamp is always 8 bytes big-endian, ensuring no variable-length encoding.
 //! This ordering is stable across SDK versions and must not change once deployed.
 //!
+//! # Deterministic hashing contract
+//!
+//! This section states the exact input/output contract of
+//! [`compute_payload_hash`]. It describes only what is implemented in this
+//! module — nothing more.
+//!
+//! ## Input (byte-level)
+//!
+//! The SHA-256 input is a single flat byte string, assembled in this order:
+//!
+//! 1. `ATTESTATION_PAYLOAD_DOMAIN` — the private domain-separation prefix
+//!    (`b"anchorkit_attestation_v1"`). Callers never supply it.
+//! 2. `subject` — the [`Address`] serialised via `to_xdr`, i.e. its raw XDR
+//!    bytes.
+//! 3. `timestamp` — exactly 8 bytes, big-endian.
+//! 4. `data` — the raw payload bytes, appended verbatim.
+//!
+//! There is **no JSON canonicalization** and no parsing of `data` in any
+//! form: `data` is hashed as the exact bytes the caller passes in. Two
+//! payloads that are semantically equal JSON but differ in whitespace or key
+//! order will therefore produce different digests. Callers that need
+//! order-insensitive structured hashing must canonicalize before calling, or
+//! use [`compute_canonical_hash`] with [`CanonicalField`]s.
+//!
+//! ## Output
+//!
+//! A 32-byte SHA-256 digest ([`BytesN<32>`]). The same inputs always produce
+//! the same digest; any change to any input field produces a different one.
+//!
+//! ## Empty payload behavior
+//!
+//! `data.len() == 0` is **rejected before hashing**: [`compute_payload_hash`]
+//! panics with [`ErrorCode::ValidationError`] and no digest is produced. This
+//! is backed by the `test_empty_payload_rejected` test in this module. The
+//! generic [`compute_canonical_hash`] has no such restriction — an empty
+//! field list is valid and hashes deterministically (see
+//! `test_canonical_hash_empty_field_list_is_stable`).
+//!
+//! ## Example (non-sensitive sample data)
+//!
+//! ```rust,no_run
+//! # use soroban_sdk::{Env, Bytes};
+//! # use soroban_sdk::testutils::Address as _;
+//! # let env = Env::default();
+//! # let subject = soroban_sdk::Address::generate(&env);
+//! use anchorkit::compute_payload_hash;
+//!
+//! // Sample, non-sensitive payload bytes — hashed verbatim, not parsed.
+//! let data = Bytes::from_slice(&env, b"sample_event");
+//! let hash = compute_payload_hash(&env, &subject, 1_700_000_000, &data);
+//! assert_eq!(hash.len(), 32);
+//! ```
+//!
 //! # Validation rules
 //!
 //! - `data` must not be empty; an empty payload is rejected before hashing to

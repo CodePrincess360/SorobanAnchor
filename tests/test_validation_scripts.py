@@ -556,6 +556,62 @@ class TestStrictValidatorFixtures:
         assert result.stderr.strip(), "Validator should emit a diagnostic on stderr for the invalid sample"
 
 
+class TestValidateDocsLinkCheck:
+    """Tests for the local Markdown link check in validate-docs.sh."""
+
+    def _run_docs_validation(self, docs_dir: Path) -> subprocess.CompletedProcess:
+        """Run validate-docs.sh scoped to a temporary docs directory."""
+        script_path = SCRIPT_DIR / "validate-docs.sh"
+        if not script_path.exists():
+            pytest.skip("validate-docs.sh not found")
+
+        env = os.environ.copy()
+        env["DOCS_DIR"] = str(docs_dir)
+        env["DOCS_LINK_CHECK_ONLY"] = "1"
+
+        return subprocess.run(
+            ["bash", str(script_path)],
+            env=env,
+            capture_output=True,
+            text=True,
+            timeout=60,
+        )
+
+    def test_detects_broken_local_link(self):
+        """A deliberately broken relative link is reported as a failure."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            docs_dir = Path(tmpdir)
+            (docs_dir / "index.md").write_text(
+                "# Index\n\nSee [missing](./does-not-exist.md).\n",
+                encoding="utf-8",
+            )
+
+            result = self._run_docs_validation(docs_dir)
+
+            assert result.returncode != 0, (
+                "Link check should fail on a broken local link. "
+                f"stdout: {result.stdout} stderr: {result.stderr}"
+            )
+            assert "does-not-exist.md" in (result.stdout + result.stderr)
+
+    def test_accepts_valid_local_link(self):
+        """A valid relative link passes the link check."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            docs_dir = Path(tmpdir)
+            (docs_dir / "index.md").write_text(
+                "# Index\n\nSee [guide](./guide.md).\n",
+                encoding="utf-8",
+            )
+            (docs_dir / "guide.md").write_text("# Guide\n", encoding="utf-8")
+
+            result = self._run_docs_validation(docs_dir)
+
+            assert result.returncode == 0, (
+                "Link check should pass on valid local links. "
+                f"stdout: {result.stdout} stderr: {result.stderr}"
+            )
+
+
 class TestValidateWasmBuildScript:
     """Tests for validate_wasm_build.sh optional environment variable handling."""
 

@@ -81,6 +81,41 @@ mod error_code_round_trip_tests {
     }
 
     // -----------------------------------------------------------------------
+    // Additional focused round-trip: `ValidationError = 15`
+    //
+    // `ValidationError` lives in the validation range and is documented in
+    // docs/error-codes.md. It exercises a different conversion path than the
+    // Auth/attestor range above, protecting a second representative code.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn validation_error_round_trips_through_u32() {
+        // Step 1 — serialize: variant → numeric representation
+        let original = ErrorCode::ValidationError;
+        let as_u32: u32 = original as u32;
+
+        // Step 2 — confirm the numeric value matches the documented constant
+        assert_eq!(
+            as_u32, 15,
+            "ErrorCode::ValidationError must serialize to 15 (documented public value)"
+        );
+
+        // Step 3 — deserialize: numeric representation → variant
+        // There is no `TryFrom<u32>` derive, so downstream integrations
+        // reconstruct by matching the raw value; mirror that path here.
+        let reconstructed = match as_u32 {
+            15 => Some(ErrorCode::ValidationError),
+            _ => None,
+        };
+
+        assert_eq!(
+            reconstructed,
+            Some(ErrorCode::ValidationError),
+            "Round-trip must reconstruct ValidationError from its u32 value"
+        );
+    }
+
+    // -----------------------------------------------------------------------
     // Confirm that the u32 representation of ReplayAttack is distinct from
     // its neighbouring variants, catching any accidental renumbering.
     // -----------------------------------------------------------------------

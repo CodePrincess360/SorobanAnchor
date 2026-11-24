@@ -124,6 +124,32 @@ relevant regression coverage for additions or intentional mapping changes.
 
 ---
 
+## Error conversion boundaries
+
+The crate exposes more than one error type. Contract entry points in
+[`src/contract.rs`](../src/contract.rs) return `AnchorKitError` (whose `code`
+field is an `ErrorCode`), while host-side helpers such as the deterministic
+hashing utilities in [`src/deterministic_hash.rs`](../src/deterministic_hash.rs)
+return their own host/parser error types. A conversion between them does not
+necessarily preserve every detail, so integrators should not assume a host error
+survives intact once it crosses into the contract boundary.
+
+| Public boundary | Error type returned |
+|-----------------|---------------------|
+| Contract entry points in [`src/contract.rs`](../src/contract.rs) (e.g. `initialize`, `register_attestor`, `submit_quote`, `route_transaction`) | Contract errors: `AnchorKitError` with an `ErrorCode` (see the [code reference](#numbering-scheme) above and [`src/errors.rs`](../src/errors.rs)) |
+| Parser / validation helpers in [`src/deterministic_hash.rs`](../src/deterministic_hash.rs) and other host modules | Host/parser errors, distinct from `AnchorKitError` |
+
+### Lossy conversions
+
+Where a host/parser error is surfaced through the contract, only the numeric
+`ErrorCode` is guaranteed to survive. For example, `panic_with_error!` discards
+the human-readable `message` and optional `context` and preserves only the
+numeric code. Do not rely on message or context text crossing a boundary; branch
+on the numeric `ErrorCode` as described in
+[Compatibility expectations](#compatibility-expectations).
+
+---
+
 ## Usage
 
 ```rust
